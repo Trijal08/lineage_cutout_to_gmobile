@@ -425,6 +425,37 @@ def clone_lineage_dependencies(
     return cloned
 
 
+def discover_sibling_codenames(roots: list[Path], target_codename: str) -> set[str]:
+    """
+    Dynamically discover all device codenames in unified device tree makefiles
+    (e.g., lineage_<codename>.mk or AndroidProducts.mk) and return all codenames
+    excluding the target.
+    """
+    found_codenames: set[str] = set()
+    target = target_codename.lower()
+
+    for root in roots:
+        for path in root.rglob("*.mk"):
+            if ".git" in path.parts:
+                continue
+
+            # Match lineage_<codename>.mk pattern
+            m = re.search(r"lineage_([a-zA-Z0-9_-]+)\.mk$", path.name, re.IGNORECASE)
+            if m:
+                found_codenames.add(m.group(1).lower())
+
+            # Check AndroidProducts.mk for product targets
+            if path.name == "AndroidProducts.mk":
+                try:
+                    text = read_text_lossy(path)
+                    for match in re.finditer(r"lineage_([a-zA-Z0-9_-]+)-", text):
+                        found_codenames.add(match.group(1).lower())
+                except OSError:
+                    pass
+
+    return found_codenames - {target}
+
+
 def interesting_text_files(root: Path) -> Iterator[Path]:
     wanted_names = {
         "README",
@@ -652,9 +683,14 @@ def find_resolution(
     codename: str,
 ) -> Optional[ResolutionCandidate]:
     candidates: list[ResolutionCandidate] = []
+    sibling_codenames = discover_sibling_codenames(roots, codename)
 
     for root in roots:
         for path in interesting_text_files(root):
+            path_parts_lower = {p.lower() for p in path.parts}
+            if path_parts_lower.intersection(sibling_codenames) or any(s in path.name.lower() for s in sibling_codenames):
+                continue
+
             try:
                 text = read_text_lossy(path)
             except OSError:
@@ -783,12 +819,19 @@ def strip_xml_namespace(tag: str) -> str:
     return tag
 
 
-def iter_xml_resource_files(roots: list[Path]) -> Iterator[Path]:
+def iter_xml_resource_files(roots: list[Path], target_codename: str) -> Iterator[Path]:
+    sibling_codenames = discover_sibling_codenames(roots, target_codename)
+
     for root in roots:
         for path in root.rglob("*.xml"):
             if ".git" in path.parts:
                 continue
-            # Most Android resource overlays live below res/values*.
+
+            # Skip overlays belonging to dynamically discovered sibling codenames
+            path_parts_lower = {p.lower() for p in path.parts}
+            if path_parts_lower.intersection(sibling_codenames):
+                continue
+
             parts = {p.lower() for p in path.parts}
             if "values" in path.parent.name.lower() or "res" in parts:
                 yield path
@@ -852,10 +895,10 @@ def parse_resource_xml_fallback(path: Path, text: str) -> list[ResourceValue]:
     return values
 
 
-def collect_resources(roots: list[Path]) -> dict[str, list[ResourceValue]]:
+def collect_resources(roots: list[Path], codename: str) -> dict[str, list[ResourceValue]]:
     resources: dict[str, list[ResourceValue]] = {}
 
-    for path in iter_xml_resource_files(roots):
+    for path in iter_xml_resource_files(roots, codename):
         for value in parse_resource_xml(path):
             resources.setdefault(value.name, []).append(value)
 
@@ -1219,6 +1262,20 @@ def compute_physical_mm(x_res: int, y_res: int, diagonal_inches: float) -> tuple
 def find_device_name(roots: list[Path], oem: str, codename: str) -> str:
     readme_candidates: list[tuple[int, str]] = []
 
+    model_pattern = re.compile(r"^\s*PRODUCT_MODEL\s*[:?+]?=\s*(.+?)\s*$", re.MULTILINE)
+    for root in roots:
+        for path in root.rglob("*.mk"):
+            if codename in path.name.lower():
+                try:
+                    text = read_text_lossy(path)
+                    m = model_pattern.search(text)
+                    if m:
+                        model = m.group(1).strip().strip('"')
+                        if model:
+                            return model
+                except OSError:
+                    continue
+
     for root in roots:
         for path in root.glob("README*"):
             if not path.is_file():
@@ -1233,11 +1290,6 @@ def find_device_name(roots: list[Path], oem: str, codename: str) -> str:
                 if not clean:
                     continue
 
-                m = re.search(r"Device configuration for\s+(.+)$", clean, re.IGNORECASE)
-                if m:
-                    readme_candidates.append((100, m.group(1).strip()))
-                    continue
-
                 m = re.search(r"The\s+(.+?)\s+\(codenamed\s+[\"']?" + re.escape(codename) + r"[\"']?\)", clean, re.IGNORECASE)
                 if m:
                     readme_candidates.append((80, m.group(1).strip()))
@@ -1246,8 +1298,6 @@ def find_device_name(roots: list[Path], oem: str, codename: str) -> str:
         readme_candidates.sort(reverse=True)
         return readme_candidates[0][1]
 
-    # PRODUCT_MODEL is also common.
-    model_pattern = re.compile(r"^\s*PRODUCT_MODEL\s*[:?+]?=\s*(.+?)\s*$", re.MULTILINE)
     for root in roots:
         for path in interesting_text_files(root):
             try:
@@ -1302,7 +1352,7 @@ def build_findings(
     if inch_candidate:
         notes.append(f"Detected display diagonal {inch_candidate.inches:g}\" from {inch_candidate.source}: {inch_candidate.line}")
 
-    resources = collect_resources(roots)
+    resources = collect_resources(roots, codename)
 
     cutout_path = resolve_reference(pick_resource(resources, [CUTOUT_RESOURCE]), resources)
     cutout_rect = resolve_reference(pick_resource(resources, [CUTOUT_RECT_RESOURCE]), resources)
