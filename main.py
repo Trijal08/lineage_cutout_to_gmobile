@@ -1178,7 +1178,13 @@ def transform_segment(
         transform_x(5)
         transform_y(6)
     elif upper == "Z":
-        pass
+        # gmobile's path parser knows 'Z' and not 'z': a lowercase closepath
+        # fails with "Unknown command 'z'", and since it gives up on the whole
+        # path the cutout ends up with zero bounds. Nothing downstream reports
+        # that -- the panel still loads, phosh just finds nothing to lay out
+        # around and leaves the clock under the cutout -- so normalise it here.
+        # Closepath takes no arguments, so case is all there is to carry.
+        cmd = "Z"
     else:
         raise ScriptError(f"Unsupported SVG path command: {cmd}")
 
